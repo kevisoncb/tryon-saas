@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+tryon.db
+storage/
+.env
