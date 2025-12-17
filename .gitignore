@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.venv/
+
+# Local storage / uploads
+backend/storage/
+backend/tryon.db
+
+# OS / Editor
+.DS_Store
+.vscode/
