@@ -1,25 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+import os
+import shutil
+from uuid import UUID
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from pathlib import Path
-from PIL import Image
-import uuid
 
 from database import SessionLocal
-from models import TryOnJob
+from schemas import TryOnCreateResponse, TryOnStatusResponse
+from crud import create_job, get_job
 
-app = FastAPI(title="TryOn SaaS")
+app = FastAPI(title="TryOn SaaS API", version="0.3.0")
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOADS_DIR = BASE_DIR / "storage" / "uploads"
-RESULTS_DIR = BASE_DIR / "storage" / "results"
-
+STORAGE_DIR = BASE_DIR / "storage"
+UPLOADS_DIR = STORAGE_DIR / "uploads"
+RESULTS_DIR = STORAGE_DIR / "results"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# -------------------------------------------------
-# DEPENDÊNCIA DO BANCO
-# -------------------------------------------------
+
 def get_db():
     db = SessionLocal()
     try:
@@ -27,98 +28,89 @@ def get_db():
     finally:
         db.close()
 
-# -------------------------------------------------
-# HEALTH
-# -------------------------------------------------
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True}
 
-# -------------------------------------------------
-# CRIAR TRY-ON
-# -------------------------------------------------
-@app.post("/tryon")
-async def create_tryon(
-    person: UploadFile = File(...),
-    garment: UploadFile = File(...),
+
+def _safe_suffix(filename: str, default: str) -> str:
+    suf = Path(filename).suffix.lower().strip()
+    if suf in (".png", ".jpg", ".jpeg", ".webp"):
+        return suf
+    return default
+
+
+@app.post("/tryon", response_model=TryOnCreateResponse)
+def create_tryon(
+    person_image: UploadFile = File(...),
+    garment_image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    if not (person.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Arquivo 'person' deve ser imagem.")
+    # salvar temporários
+    tmp_person = UPLOADS_DIR / f"tmp_person_{os.urandom(8).hex()}_{person_image.filename}"
+    tmp_garment = UPLOADS_DIR / f"tmp_garment_{os.urandom(8).hex()}_{garment_image.filename}"
 
-    if not (garment.content_type or "").startswith("image/"):
-        raise HTTPException(status_code=400, detail="Arquivo 'garment' deve ser imagem.")
+    with tmp_person.open("wb") as f:
+        shutil.copyfileobj(person_image.file, f)
+    with tmp_garment.open("wb") as f:
+        shutil.copyfileobj(garment_image.file, f)
 
-    job_id = uuid.uuid4()
+    # criar job no DB com paths temporários
+    job = create_job(db, str(tmp_person), str(tmp_garment))
 
-    person_path = UPLOADS_DIR / f"{job_id}_person.jpg"
-    garment_path = UPLOADS_DIR / f"{job_id}_garment.jpg"
-    result_path = RESULTS_DIR / f"{job_id}.png"
+    # renomear arquivos para incluir job_id
+    person_ext = _safe_suffix(person_image.filename, ".jpg")
+    garment_ext = _safe_suffix(garment_image.filename, ".png")
 
-    person_path.write_bytes(await person.read())
-    garment_path.write_bytes(await garment.read())
+    final_person = UPLOADS_DIR / f"{job.id}_person{person_ext}"
+    final_garment = UPLOADS_DIR / f"{job.id}_garment{garment_ext}"
 
-    _make_mock_result(person_path, garment_path, result_path)
+    tmp_person.replace(final_person)
+    tmp_garment.replace(final_garment)
 
-    job = TryOnJob(
-        id=job_id,
-        status="done",
-        person_image_path=str(person_path),
-        garment_image_path=str(garment_path),
-        result_image_path=str(result_path),
-    )
-
-    db.add(job)
+    # atualizar paths finais no DB
+    job.person_image_path = str(final_person)
+    job.garment_image_path = str(final_garment)
     db.commit()
     db.refresh(job)
 
-    return {
-        "job_id": job.id,   # UUID puro (FastAPI serializa)
-        "status": job.status
-    }
+    # agora é async via worker (status queued)
+    return TryOnCreateResponse(job_id=job.id, status=job.status)
 
-# -------------------------------------------------
-# CONSULTAR STATUS
-# -------------------------------------------------
-@app.get("/tryon/{job_id}")
-def get_tryon(job_id: uuid.UUID, db: Session = Depends(get_db)):
-    job = db.query(TryOnJob).filter(TryOnJob.id == job_id).first()
 
+@app.get("/tryon/{job_id}", response_model=TryOnStatusResponse)
+def tryon_status(job_id: UUID, db: Session = Depends(get_db)):
+    job = get_job(db, job_id)
     if not job:
-        raise HTTPException(status_code=404, detail="Job não encontrado.")
+        raise HTTPException(status_code=404, detail="Job not found")
 
-    return {
-        "job_id": job.id,
-        "status": job.status
-    }
+    return TryOnStatusResponse(
+        job_id=job.id,
+        status=job.status,
+        person_image_path=job.person_image_path,
+        garment_image_path=job.garment_image_path,
+        result_image_path=job.result_image_path,
+        error_message=getattr(job, "error_message", None),
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    )
 
-# -------------------------------------------------
-# BAIXAR RESULTADO
-# -------------------------------------------------
+
 @app.get("/tryon/{job_id}/result")
-def get_result(job_id: uuid.UUID, db: Session = Depends(get_db)):
-    job = db.query(TryOnJob).filter(TryOnJob.id == job_id).first()
+def tryon_result(job_id: UUID, db: Session = Depends(get_db)):
+    job = get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-    if not job or not job.result_image_path:
-        raise HTTPException(status_code=404, detail="Resultado não encontrado.")
+    if job.status == "error":
+        raise HTTPException(status_code=409, detail=f"Job errored: {job.error_message}")
 
-    return FileResponse(job.result_image_path)
+    if job.status != "done" or not job.result_image_path:
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
 
-# -------------------------------------------------
-# MOCK DO TRY-ON (TEMPORÁRIO)
-# -------------------------------------------------
-def _make_mock_result(person_path: Path, garment_path: Path, out_path: Path):
-    person = Image.open(person_path).convert("RGBA")
-    garment = Image.open(garment_path).convert("RGBA")
+    path = Path(job.result_image_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Result file not found on disk")
 
-    target_w = int(person.width * 0.45)
-    scale = target_w / garment.width
-    target_h = int(garment.height * scale)
-
-    garment = garment.resize((target_w, target_h))
-
-    x = int((person.width - target_w) / 2)
-    y = int(person.height * 0.25)
-
-    person.alpha_composite(garment, (x, y))
-    person.save(out_path)
+    return FileResponse(path)

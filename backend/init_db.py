@@ -1,6 +1,5 @@
-from database import engine
-from models import Base
+from database import engine, Base
+import models  # noqa: F401
 
 Base.metadata.create_all(bind=engine)
-
 print("Banco inicializado com sucesso.")
