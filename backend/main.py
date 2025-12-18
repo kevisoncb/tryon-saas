@@ -10,8 +10,9 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from schemas import TryOnCreateResponse, TryOnStatusResponse
 from crud import create_job, get_job
+from auth import require_api_key
 
-app = FastAPI(title="TryOn SaaS API", version="0.3.0")
+app = FastAPI(title="TryOn SaaS API", version="0.4.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
@@ -46,6 +47,7 @@ def create_tryon(
     person_image: UploadFile = File(...),
     garment_image: UploadFile = File(...),
     db: Session = Depends(get_db),
+    api_key=Depends(require_api_key),
 ):
     # salvar temporários
     tmp_person = UPLOADS_DIR / f"tmp_person_{os.urandom(8).hex()}_{person_image.filename}"
@@ -72,18 +74,26 @@ def create_tryon(
     # atualizar paths finais no DB
     job.person_image_path = str(final_person)
     job.garment_image_path = str(final_garment)
+    job.api_key_id = api_key.id
     db.commit()
     db.refresh(job)
 
-    # agora é async via worker (status queued)
     return TryOnCreateResponse(job_id=job.id, status=job.status)
 
 
 @app.get("/tryon/{job_id}", response_model=TryOnStatusResponse)
-def tryon_status(job_id: UUID, db: Session = Depends(get_db)):
+def tryon_status(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    api_key=Depends(require_api_key),
+):
     job = get_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # proteção: só o dono vê
+    if job.api_key_id and job.api_key_id != api_key.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     return TryOnStatusResponse(
         job_id=job.id,
@@ -98,10 +108,17 @@ def tryon_status(job_id: UUID, db: Session = Depends(get_db)):
 
 
 @app.get("/tryon/{job_id}/result")
-def tryon_result(job_id: UUID, db: Session = Depends(get_db)):
+def tryon_result(
+    job_id: UUID,
+    db: Session = Depends(get_db),
+    api_key=Depends(require_api_key),
+):
     job = get_job(db, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.api_key_id and job.api_key_id != api_key.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     if job.status == "error":
         raise HTTPException(status_code=409, detail=f"Job errored: {job.error_message}")
