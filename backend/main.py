@@ -1,33 +1,35 @@
-import os
-import shutil
-from uuid import UUID
-from pathlib import Path
+from __future__ import annotations
 
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+import mimetypes
+from pathlib import Path
+from uuid import UUID, uuid4
+
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from database import SessionLocal
-from schemas import TryOnCreateResponse, TryOnStatusResponse
-from crud import create_job, get_job
 from auth import require_api_key
+from crud import create_tryon_job, get_tryon_job
+from database import get_db
+from schemas import TryOnCreateResponse, TryOnStatusResponse
+from settings import API_BASE_URL, RESULTS_DIR, STORAGE_DIR, UPLOADS_DIR
 
-app = FastAPI(title="TryOn SaaS API", version="0.4.1")
+app = FastAPI(title="TryOn SaaS API", version="1.0.0")
 
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
-UPLOADS_DIR = STORAGE_DIR / "uploads"
-RESULTS_DIR = STORAGE_DIR / "results"
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# Servir storage (uploads/results/logs) por URL
+# Exemplo: http://127.0.0.1:8000/storage/results/<job_id>.png
+app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def _save_upload(file: UploadFile, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as f:
+        f.write(file.file.read())
+
+
+def _result_url_for_job(job_id: UUID) -> str:
+    return f"{API_BASE_URL}/tryon/{job_id}/result"
 
 
 @app.get("/health")
@@ -35,60 +37,42 @@ def health():
     return {"ok": True}
 
 
-def _safe_suffix(filename: str, default: str) -> str:
-    suf = Path(filename).suffix.lower().strip()
-    if suf in (".png", ".jpg", ".jpeg", ".webp"):
-        return suf
-    return default
-
-
 @app.post("/tryon", response_model=TryOnCreateResponse)
 def create_tryon(
     person_image: UploadFile = File(...),
     garment_image: UploadFile = File(...),
     db: Session = Depends(get_db),
-    api_key=Depends(require_api_key),
+    _: str = Depends(require_api_key),
 ):
-    tmp_person = UPLOADS_DIR / f"tmp_person_{os.urandom(8).hex()}_{person_image.filename}"
-    tmp_garment = UPLOADS_DIR / f"tmp_garment_{os.urandom(8).hex()}_{garment_image.filename}"
+    job_id = uuid4()
 
-    with tmp_person.open("wb") as f:
-        shutil.copyfileobj(person_image.file, f)
-    with tmp_garment.open("wb") as f:
-        shutil.copyfileobj(garment_image.file, f)
+    # Salva uploads
+    person_path = UPLOADS_DIR / f"{job_id}_person.jpg"
+    garment_path = UPLOADS_DIR / f"{job_id}_garment.jpg"
 
-    job = create_job(db, str(tmp_person), str(tmp_garment))
+    _save_upload(person_image, person_path)
+    _save_upload(garment_image, garment_path)
 
-    person_ext = _safe_suffix(person_image.filename, ".jpg")
-    garment_ext = _safe_suffix(garment_image.filename, ".png")
-
-    final_person = UPLOADS_DIR / f"{job.id}_person{person_ext}"
-    final_garment = UPLOADS_DIR / f"{job.id}_garment{garment_ext}"
-
-    tmp_person.replace(final_person)
-    tmp_garment.replace(final_garment)
-
-    job.person_image_path = str(final_person)
-    job.garment_image_path = str(final_garment)
-    job.api_key_id = api_key.id
-    db.commit()
-    db.refresh(job)
+    # Cria job no banco como queued
+    job = create_tryon_job(
+        db=db,
+        job_id=job_id,
+        person_image_path=str(person_path),
+        garment_image_path=str(garment_path),
+    )
 
     return TryOnCreateResponse(job_id=job.id, status=job.status)
 
 
 @app.get("/tryon/{job_id}", response_model=TryOnStatusResponse)
-def tryon_status(
-    job_id: UUID,
-    db: Session = Depends(get_db),
-    api_key=Depends(require_api_key),
-):
-    job = get_job(db, job_id)
+def get_tryon(job_id: UUID, db: Session = Depends(get_db), _: str = Depends(require_api_key)):
+    job = get_tryon_job(db=db, job_id=job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.api_key_id and job.api_key_id != api_key.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    result_url = None
+    if job.status == "done":
+        result_url = _result_url_for_job(job.id)
 
     return TryOnStatusResponse(
         job_id=job.id,
@@ -96,33 +80,35 @@ def tryon_status(
         person_image_path=job.person_image_path,
         garment_image_path=job.garment_image_path,
         result_image_path=job.result_image_path,
-        error_message=getattr(job, "error_message", None),
+        result_url=result_url,
+        error_message=job.error_message,
         created_at=job.created_at,
         updated_at=job.updated_at,
     )
 
 
 @app.get("/tryon/{job_id}/result")
-def tryon_result(
-    job_id: UUID,
-    db: Session = Depends(get_db),
-    api_key=Depends(require_api_key),
-):
-    job = get_job(db, job_id)
+def get_tryon_result(job_id: UUID, db: Session = Depends(get_db), _: str = Depends(require_api_key)):
+    job = get_tryon_job(db=db, job_id=job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.api_key_id and job.api_key_id != api_key.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    if job.status == "queued" or job.status == "processing":
+        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
 
     if job.status == "error":
         raise HTTPException(status_code=409, detail=f"Job errored: {job.error_message}")
 
-    if job.status != "done" or not job.result_image_path:
-        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
+    if not job.result_image_path:
+        raise HTTPException(status_code=500, detail="Job done but no result_image_path stored")
 
-    path = Path(job.result_image_path)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Result file not found on disk")
+    p = Path(job.result_image_path)
+    if not p.exists():
+        raise HTTPException(status_code=500, detail="Result file missing on disk")
 
-    return FileResponse(path)
+    # Força PNG quando aplicável
+    media_type = mimetypes.guess_type(str(p))[0] or "image/png"
+    headers = {
+        "Cache-Control": "no-store",
+    }
+    return FileResponse(path=str(p), media_type=media_type, headers=headers)
