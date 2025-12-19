@@ -15,8 +15,8 @@ from models import TryOnJob
 
 from image_utils import (
     is_background_white,
-    remove_white_background_fast,
-    detect_torso_box_mediapipe,
+    remove_white_background_premium,
+    detect_torso_anchor_mediapipe,
     overlay_bgra_on_bgr,
 )
 
@@ -57,29 +57,21 @@ def _get_one_queued_job(db: Session) -> TryOnJob | None:
     return job
 
 
-def _set_processing(db: Session, job: TryOnJob):
-    job.status = "processing"
-    job.attempts = (job.attempts or 0) + 1
-    job.last_error = None
-    job.error_message = None
-    job.processing_started_at = None  # opcional; se você usa, set aqui com datetime
+def _set_status(db: Session, job: TryOnJob, status: str, err: str | None = None, result_path: str | None = None):
+    job.status = status
+    if status == "processing":
+        job.attempts = (job.attempts or 0) + 1
+        job.error_message = None
+        job.last_error = None
+    if status == "done":
+        job.result_image_path = result_path
+        job.error_message = None
+        job.last_error = None
+    if status == "error":
+        job.error_message = (err or "Unknown error")[:2000]
+        job.last_error = (err or "Unknown error")[:2000]
     db.commit()
     db.refresh(job)
-
-
-def _set_done(db: Session, job: TryOnJob, result_path: str):
-    job.status = "done"
-    job.result_image_path = result_path
-    job.error_message = None
-    job.last_error = None
-    db.commit()
-
-
-def _set_error(db: Session, job: TryOnJob, err: str):
-    job.status = "error"
-    job.error_message = err[:2000]
-    job.last_error = err[:2000]
-    db.commit()
 
 
 def _process_job(job: TryOnJob) -> str:
@@ -98,37 +90,36 @@ def _process_job(job: TryOnJob) -> str:
     garment_bgr = cv2.imread(str(garment_path), cv2.IMREAD_COLOR)
 
     if person_bgr is None:
-        raise ValueError("Failed to read person image")
+        raise ValueError("Failed to read person image (cv2.imread returned None)")
     if garment_bgr is None:
-        raise ValueError("Failed to read garment image")
+        raise ValueError("Failed to read garment image (cv2.imread returned None)")
 
-    # 1) Validação: fundo branco recomendado
+    # Validação de entrada (produto)
     if not is_background_white(garment_bgr):
         raise ValueError(
             "Garment background is not white enough. Please upload the garment photo on a white background."
         )
 
-    # 2) Detect torso box no person
-    box = detect_torso_box_mediapipe(person_bgr)
-    if box is None:
-        raise ValueError("Could not detect torso/pose on person image. Try a full-body/clear photo.")
+    anchor = detect_torso_anchor_mediapipe(person_bgr)
+    if anchor is None:
+        raise ValueError("Could not detect pose/anchor. Try a full-body/clear photo.")
 
     # 3) Remove fundo e gera BGRA
     garment_bgra = remove_white_background_fast(garment_bgr)
 
-    # 4) Resize garment para caber no torso
-    target_w = box.w
-    target_h = box.h
-    garment_resized = cv2.resize(garment_bgra, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    garment_resized = cv2.resize(
+        garment_bgra,
+        (anchor.w, anchor.h),
+        interpolation=cv2.INTER_AREA,
+    )
 
-    # 5) Overlay no person
-    out_bgr = overlay_bgra_on_bgr(person_bgr, garment_resized, box.x1, box.y1)
+    out_bgr = overlay_bgra_on_bgr(person_bgr, garment_resized, anchor.x, anchor.y)
 
     # 6) Salvar resultado
     out_path = RESULTS_DIR / f"{job.id}.png"
     ok = cv2.imwrite(str(out_path), out_bgr)
     if not ok:
-        raise RuntimeError("Failed to write result image")
+        raise RuntimeError("Failed to write result image (cv2.imwrite returned False)")
 
     return str(out_path)
 
@@ -137,6 +128,7 @@ def main():
     print("Worker iniciado. Aguardando jobs queued... (CTRL+C para sair)")
     while True:
         db = SessionLocal()
+        job = None
         try:
             db.begin()
             job = _get_one_queued_job(db)
@@ -147,32 +139,33 @@ def main():
 
             # Se excedeu tentativas, marca erro definitivo
             if (job.attempts or 0) >= MAX_ATTEMPTS:
-                _set_error(db, job, f"Max attempts reached ({MAX_ATTEMPTS}).")
+                _set_status(db, job, "error", err=f"Max attempts reached ({MAX_ATTEMPTS}).")
                 time.sleep(0.2)
                 continue
 
-            _set_processing(db, job)
+            _set_status(db, job, "processing")
 
-            # Processamento pesado fora do lock
+            # processamento pesado
             result_path = _process_job(job)
 
-            # Reabrir sessão para salvar resultado (ou reuse db, ok)
-            _set_done(db, job, result_path)
+            _set_status(db, job, "done", result_path=result_path)
             print(f"[DONE] job={job.id} result={result_path}")
 
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             tb = traceback.format_exc()
+
+            # Se ainda tem tentativas, você pode optar por requeue em vez de error definitivo.
+            # Aqui vamos marcar error mesmo, mas com mensagem clara.
             try:
-                # tenta marcar erro no job se existir
-                if "job" in locals() and isinstance(locals()["job"], TryOnJob) and locals()["job"] is not None:
-                    _set_error(db, locals()["job"], err)
-                    print(f"[ERROR] job={locals()['job'].id} {err}")
+                if job is not None:
+                    _set_status(db, job, "error", err=err)
+                    print(f"[ERROR] job={job.id} {err}")
                 else:
                     print(f"[ERROR] {err}")
             except Exception:
                 print("[ERROR] failed to persist error state")
-            # Log detalhado no console (útil em dev)
+
             print(tb)
 
         finally:
