@@ -1,3 +1,4 @@
+# backend/app/api/main.py
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
@@ -10,6 +11,7 @@ from app.api.routes.admin import router as admin_router
 def create_app() -> FastAPI:
     app = FastAPI(title=API_TITLE, version=API_VERSION)
 
+    # Serve arquivos gerados/armazenados
     app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
 
     @app.get("/health")

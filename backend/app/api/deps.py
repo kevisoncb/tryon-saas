@@ -1,19 +1,16 @@
-from fastapi import Depends
-from sqlalchemy.orm import Session
+# backend/app/api/deps.py
+from __future__ import annotations
 
-from app.infra.db.database import get_db
-from app.infra.db.crud import get_api_key
+from fastapi import Depends
+
+from app.infra.db.models import ApiKey
 from app.security.auth import require_api_key
 from app.security.rate_limiter import SimpleRateLimiter
 
 limiter = SimpleRateLimiter()
 
 
-def rate_limit(
-    api_key: str = Depends(require_api_key),
-    db: Session = Depends(get_db),
-) -> str:
-    row = get_api_key(db, api_key)
-    if row:
-        limiter.check(api_key, int(row.rpm_limit or 60))
+def rate_limit(api_key: ApiKey = Depends(require_api_key)) -> ApiKey:
+    rpm = int(api_key.rpm_limit or 60)
+    limiter.check(api_key.key, rpm)
     return api_key
