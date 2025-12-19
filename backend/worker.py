@@ -13,7 +13,7 @@ from models import TryOnJob
 from image_utils import (
     is_background_white,
     remove_white_background_premium,
-    detect_torso_box_mediapipe,
+    detect_torso_anchor_mediapipe,
     overlay_bgra_on_bgr,
 )
 
@@ -93,14 +93,14 @@ def _process_job(job: TryOnJob) -> str:
     if not is_background_white(garment_bgr):
         raise ValueError("Garment background is not white enough. Upload the garment photo on a white background.")
 
-    box = detect_torso_box_mediapipe(person_bgr)
-    if box is None:
-        raise ValueError("Could not detect torso/pose on person image. Try a full-body/clear photo.")
+    anchor = detect_torso_anchor_mediapipe(person_bgr)
+    if anchor is None:
+        raise ValueError("Could not detect pose/anchor. Try a full-body/clear photo.")
 
     garment_bgra = remove_white_background_premium(garment_bgr)
 
-    garment_resized = cv2.resize(garment_bgra, (box.w, box.h), interpolation=cv2.INTER_AREA)
-    out_bgr = overlay_bgra_on_bgr(person_bgr, garment_resized, box.x1, box.y1)
+    garment_resized = cv2.resize(garment_bgra, (anchor.w, anchor.h), interpolation=cv2.INTER_AREA)
+    out_bgr = overlay_bgra_on_bgr(person_bgr, garment_resized, anchor.x, anchor.y)
 
     out_path = RESULTS_DIR / f"{job.id}.png"
     ok = cv2.imwrite(str(out_path), out_bgr)
