@@ -1,130 +1,99 @@
 from __future__ import annotations
 
-import mimetypes
-import os
+import traceback
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID
 
-import redis
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from rq import Queue
+import cv2
 from sqlalchemy.orm import Session
 
-from auth import require_api_key
-from crud import create_tryon_job, get_tryon_job
-from database import get_db
-from schemas import TryOnCreateResponse, TryOnStatusResponse
-from tasks import process_tryon_job
-
-BASE_DIR = Path(__file__).resolve().parent
-STORAGE_DIR = BASE_DIR / "storage"
-UPLOADS_DIR = STORAGE_DIR / "uploads"
-RESULTS_DIR = STORAGE_DIR / "results"
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
-
-app = FastAPI(title="TryOn SaaS API", version="1.1.0")
-app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
+from config import LOGS_DIR, RESULTS_DIR
+from database import SessionLocal
+from models import TryOnJob
+from image_utils import (
+    is_background_white_strict,
+    remove_white_background_premium,
+    detect_torso_anchor_mediapipe,
+    overlay_bgra_on_bgr,
+)
 
 
-def _save_upload(file: UploadFile, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    content = file.file.read()
-    with out_path.open("wb") as f:
-        f.write(content)
+def _log(job_id: str, msg: str):
+    line = f"{job_id} | {msg}"
+    print(line)
+    try:
+        (LOGS_DIR / f"{job_id}.log").open("a", encoding="utf-8").write(line + "\n")
+    except Exception:
+        pass
 
 
-def _result_url_for_job(job_id: UUID) -> str:
-    return f"{API_BASE_URL}/tryon/{job_id}/result"
+def _read_bgr(path: Path):
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Failed to read image: {path}")
+    return img
 
 
-def _get_queue() -> Queue:
-    r = redis.from_url(REDIS_URL)
-    return Queue("tryon", connection=r)
+def process_tryon_job(job_id: str) -> None:
+    db: Session = SessionLocal()
+    try:
+        jid = UUID(job_id)
+        job = db.query(TryOnJob).filter(TryOnJob.id == jid).first()
+        if not job:
+            return
 
+        job.status = "processing"
+        job.error_message = None
+        db.commit()
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+        _log(job_id, "Loading images")
+        person_bgr = _read_bgr(Path(job.person_image_path))
+        garment_bgr = _read_bgr(Path(job.garment_image_path))
 
+        _log(job_id, "Validating white background")
+        if not is_background_white_strict(garment_bgr):
+            raise ValueError("Garment background is not white enough. Use clean white background.")
 
-@app.post("/tryon", response_model=TryOnCreateResponse)
-def create_tryon(
-    person_image: UploadFile = File(...),
-    garment_image: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    _: str = Depends(require_api_key),
-):
-    job_id = uuid4()
+        _log(job_id, "Detecting anchor")
+        anchor = detect_torso_anchor_mediapipe(person_bgr)
+        if anchor is None:
+            raise ValueError("Pose anchor not detected. Ensure shoulders/torso are visible.")
 
-    person_path = UPLOADS_DIR / f"{job_id}_person.jpg"
-    garment_path = UPLOADS_DIR / f"{job_id}_garment.jpg"
-    _save_upload(person_image, person_path)
-    _save_upload(garment_image, garment_path)
+        _log(job_id, "Cutting garment")
+        garment_bgra = remove_white_background_premium(garment_bgr)
 
-    job = create_tryon_job(
-        db=db,
-        job_id=job_id,
-        person_image_path=str(person_path),
-        garment_image_path=str(garment_path),
-    )
+        _log(job_id, "Compositing")
+        garment_resized = cv2.resize(garment_bgra, (anchor.w, anchor.h), interpolation=cv2.INTER_AREA)
+        out_bgr = overlay_bgra_on_bgr(person_bgr, garment_resized, anchor.x, anchor.y)
 
-    # Enfileira o job (RQ)
-    q = _get_queue()
-    q.enqueue(process_tryon_job, str(job.id), job_timeout=600)
+        out_path = RESULTS_DIR / f"{job.id}.png"
+        ok = cv2.imwrite(str(out_path), out_bgr)
+        if not ok:
+            raise RuntimeError("Failed to write output")
 
-    return TryOnCreateResponse(job_id=job.id, status=job.status)
+        job.status = "done"
+        job.result_image_path = str(out_path)
+        job.error_message = None
+        db.commit()
 
+        _log(job_id, f"Done: {out_path.name}")
 
-@app.get("/tryon/{job_id}", response_model=TryOnStatusResponse)
-def get_tryon(job_id: UUID, db: Session = Depends(get_db), _: str = Depends(require_api_key)):
-    job = get_tryon_job(db=db, job_id=job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        tb = traceback.format_exc()
+        try:
+            job = db.query(TryOnJob).filter(TryOnJob.id == UUID(job_id)).first()
+            if job:
+                job.status = "error"
+                job.error_message = err[:2000]
+                db.commit()
+        except Exception:
+            pass
 
-    result_url = None
-    if job.status == "done":
-        result_url = _result_url_for_job(job.id)
+        try:
+            (LOGS_DIR / f"{job_id}.log").open("a", encoding="utf-8").write(tb + "\n")
+        except Exception:
+            pass
 
-    return TryOnStatusResponse(
-        job_id=job.id,
-        status=job.status,
-        person_image_path=job.person_image_path,
-        garment_image_path=job.garment_image_path,
-        result_image_path=job.result_image_path,
-        result_url=result_url,
-        error_message=job.error_message,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-    )
-
-
-@app.get("/tryon/{job_id}/result")
-def get_tryon_result(job_id: UUID, db: Session = Depends(get_db), _: str = Depends(require_api_key)):
-    job = get_tryon_job(db=db, job_id=job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if job.status in ("queued", "processing"):
-        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
-    if job.status == "error":
-        raise HTTPException(status_code=409, detail=f"Job errored: {job.error_message}")
-
-    if not job.result_image_path:
-        raise HTTPException(status_code=500, detail="Job done but no result_image_path")
-
-    p = Path(job.result_image_path)
-    if not p.exists():
-        raise HTTPException(status_code=500, detail="Result file missing on disk")
-
-    media_type = mimetypes.guess_type(str(p))[0] or "image/png"
-    return FileResponse(
-        path=str(p),
-        media_type=media_type,
-        headers={"Cache-Control": "no-store"},
-    )
+    finally:
+        db.close()
