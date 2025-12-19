@@ -42,28 +42,39 @@ class TorsoAnchor:
     h: int
 
 
-def is_background_white(
+def _lm_xy(lm, w: int, h: int) -> Tuple[float, float]:
+    return float(lm.x) * w, float(lm.y) * h
+
+
+def is_background_white_strict(
     image_bgr: np.ndarray,
-    sample_border: int = 25,
-    white_thresh: int = 235,
-    min_white_ratio: float = 0.92,
+    border: int = 28,
+    min_ratio_rgb: float = 0.90,
+    rgb_thresh: int = 238,
+    min_ratio_hsv: float = 0.85,
+    hsv_s_max: int = 35,
+    hsv_v_min: int = 235,
 ) -> bool:
     """
-    Verifica se o fundo é predominantemente branco olhando as bordas.
-    Útil para exigir foto da roupa com fundo branco.
+    Validação "fundo branco" mais confiável:
+    - analisa apenas as bordas (onde o fundo normalmente aparece)
+    - usa duas métricas:
+      (1) RGB >= rgb_thresh
+      (2) HSV: S baixo + V alto
+    Passa se ambas atingirem seus mínimos.
     """
     if image_bgr is None or image_bgr.size == 0:
         return False
 
     h, w = image_bgr.shape[:2]
-    b = max(5, min(sample_border, h // 10, w // 10))
+    b = max(8, min(border, h // 10, w // 10))
 
     top = image_bgr[0:b, :, :]
     bottom = image_bgr[h - b : h, :, :]
     left = image_bgr[:, 0:b, :]
     right = image_bgr[:, w - b : w, :]
 
-    border = np.concatenate(
+    border_px = np.concatenate(
         [
             top.reshape(-1, 3),
             bottom.reshape(-1, 3),
@@ -73,13 +84,23 @@ def is_background_white(
         axis=0,
     )
 
-    white = (
-        (border[:, 0] >= white_thresh)
-        & (border[:, 1] >= white_thresh)
-        & (border[:, 2] >= white_thresh)
+    # (1) RGB whiteness
+    rgb_white = (
+        (border_px[:, 0] >= rgb_thresh)
+        & (border_px[:, 1] >= rgb_thresh)
+        & (border_px[:, 2] >= rgb_thresh)
     )
-    ratio = float(np.mean(white))
-    return ratio >= min_white_ratio
+    ratio_rgb = float(np.mean(rgb_white))
+
+    # (2) HSV whiteness (S baixo, V alto)
+    border_img = border_px.reshape(-1, 1, 3).astype(np.uint8)
+    hsv = cv2.cvtColor(border_img, cv2.COLOR_BGR2HSV).reshape(-1, 3)
+    s = hsv[:, 1]
+    v = hsv[:, 2]
+    hsv_white = (s <= hsv_s_max) & (v >= hsv_v_min)
+    ratio_hsv = float(np.mean(hsv_white))
+
+    return (ratio_rgb >= min_ratio_rgb) and (ratio_hsv >= min_ratio_hsv)
 
 
 def remove_white_background_premium(
@@ -92,11 +113,11 @@ def remove_white_background_premium(
     dehalo_strength: float = 0.75,
 ) -> np.ndarray:
     """
-    Remove fundo branco gerando BGRA (alpha) com melhor qualidade:
-    - usa distância BGR até o branco em vez de threshold simples;
-    - faz morfologia para limpar bordas;
-    - feather no alpha;
-    - dehalo simples para reduzir halo branco.
+    Remove fundo branco -> retorna BGRA (alpha) com qualidade superior:
+    - alpha por distância até branco
+    - morfologia para limpar borda
+    - feather no alpha
+    - dehalo simples para reduzir halo branco
     """
     if garment_bgr is None or garment_bgr.size == 0:
         raise ValueError("garment_bgr is empty")
@@ -106,7 +127,6 @@ def remove_white_background_premium(
 
     dist = np.linalg.norm(garment - white, axis=2).astype(np.float32)
 
-    # Quanto mais perto do branco, menor alpha. dist_thresh controla agressividade.
     denom = max(1.0, (255.0 - float(dist_thresh)))
     alpha = np.clip((dist - float(dist_thresh)) * (255.0 / denom), 0, 255).astype(np.uint8)
 
@@ -137,10 +157,6 @@ def remove_white_background_premium(
     return bgra
 
 
-def _lm_xy(lm, w: int, h: int) -> Tuple[float, float]:
-    return float(lm.x) * w, float(lm.y) * h
-
-
 def detect_torso_box_mediapipe(
     person_bgr: np.ndarray,
     expand_x: float = 0.20,
@@ -148,6 +164,7 @@ def detect_torso_box_mediapipe(
 ) -> Optional[TorsoBox]:
     """
     Box aproximado do torso usando MediaPipe Pose (ombros + quadris).
+    Mantido para fallback/debug.
     """
     if person_bgr is None or person_bgr.size == 0:
         return None
@@ -222,8 +239,8 @@ def detect_torso_anchor_mediapipe(
 
     lsx, lsy = _lm_xy(ls, w, h)
     rsx, rsy = _lm_xy(rs, w, h)
-    lhx, lhy = _lm_xy(lh, w, h)
-    rhx, rhy = _lm_xy(rh, w, h)
+    lhy = _lm_xy(lh, w, h)[1]
+    rhy = _lm_xy(rh, w, h)[1]
 
     shoulder_w = max(10.0, abs(rsx - lsx))
     center_x = (lsx + rsx) / 2.0
@@ -251,12 +268,7 @@ def detect_torso_anchor_mediapipe(
     return TorsoAnchor(x=x1, y=y1, w=max(10, target_w), h=max(10, target_h))
 
 
-def overlay_bgra_on_bgr(
-    base_bgr: np.ndarray,
-    overlay_bgra: np.ndarray,
-    x: int,
-    y: int,
-) -> np.ndarray:
+def overlay_bgra_on_bgr(base_bgr: np.ndarray, overlay_bgra: np.ndarray, x: int, y: int) -> np.ndarray:
     """
     Sobrepõe overlay BGRA (com alpha) em base BGR na posição (x,y).
     """
