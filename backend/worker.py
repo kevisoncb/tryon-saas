@@ -49,28 +49,26 @@ def _get_one_queued_job(db: Session) -> TryOnJob | None:
     return db.query(TryOnJob).filter(TryOnJob.id == job_id).first()
 
 
-def _set_processing(db: Session, job: TryOnJob):
-    job.status = "processing"
-    job.attempts = (job.attempts or 0) + 1
-    job.error_message = None
-    job.last_error = None
+def _set_status(db: Session, job: TryOnJob, status: str, err: str | None = None, result_path: str | None = None):
+    job.status = status
+
+    if status == "processing":
+        job.attempts = (job.attempts or 0) + 1
+        job.error_message = None
+        job.last_error = None
+
+    if status == "done":
+        job.result_image_path = result_path
+        job.error_message = None
+        job.last_error = None
+
+    if status == "error":
+        msg = (err or "Unknown error")[:2000]
+        job.error_message = msg
+        job.last_error = msg
+
     db.commit()
     db.refresh(job)
-
-
-def _set_done(db: Session, job: TryOnJob, result_path: str):
-    job.status = "done"
-    job.result_image_path = result_path
-    job.error_message = None
-    job.last_error = None
-    db.commit()
-
-
-def _set_error(db: Session, job: TryOnJob, err: str):
-    job.status = "error"
-    job.error_message = err[:2000]
-    job.last_error = err[:2000]
-    db.commit()
 
 
 def _process_job(job: TryOnJob) -> str:
@@ -86,9 +84,9 @@ def _process_job(job: TryOnJob) -> str:
     garment_bgr = cv2.imread(str(garment_path), cv2.IMREAD_COLOR)
 
     if person_bgr is None:
-        raise ValueError("Failed to read person image")
+        raise ValueError("Failed to read person image (cv2.imread returned None)")
     if garment_bgr is None:
-        raise ValueError("Failed to read garment image")
+        raise ValueError("Failed to read garment image (cv2.imread returned None)")
 
     if not is_background_white(garment_bgr):
         raise ValueError("Garment background is not white enough. Upload the garment photo on a white background.")
@@ -105,7 +103,7 @@ def _process_job(job: TryOnJob) -> str:
     out_path = RESULTS_DIR / f"{job.id}.png"
     ok = cv2.imwrite(str(out_path), out_bgr)
     if not ok:
-        raise RuntimeError("Failed to write result image")
+        raise RuntimeError("Failed to write result image (cv2.imwrite returned False)")
 
     return str(out_path)
 
@@ -114,6 +112,7 @@ def main():
     print("Worker iniciado. Aguardando jobs queued... (CTRL+C para sair)")
     while True:
         db = SessionLocal()
+        job = None
         try:
             db.begin()
             job = _get_one_queued_job(db)
@@ -123,23 +122,23 @@ def main():
                 continue
 
             if (job.attempts or 0) >= MAX_ATTEMPTS:
-                _set_error(db, job, f"Max attempts reached ({MAX_ATTEMPTS}).")
+                _set_status(db, job, "error", err=f"Max attempts reached ({MAX_ATTEMPTS}).")
                 time.sleep(0.2)
                 continue
 
-            _set_processing(db, job)
+            _set_status(db, job, "processing")
 
             result_path = _process_job(job)
-            _set_done(db, job, result_path)
+            _set_status(db, job, "done", result_path=result_path)
             print(f"[DONE] job={job.id} result={result_path}")
 
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             tb = traceback.format_exc()
             try:
-                if "job" in locals() and isinstance(locals()["job"], TryOnJob) and locals()["job"] is not None:
-                    _set_error(db, locals()["job"], err)
-                    print(f"[ERROR] job={locals()['job'].id} {err}")
+                if job is not None:
+                    _set_status(db, job, "error", err=err)
+                    print(f"[ERROR] job={job.id} {err}")
                 else:
                     print(f"[ERROR] {err}")
             except Exception:
