@@ -22,7 +22,3 @@ class TryOnStatusResponse(BaseModel):
     error_message: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-
-
-class ErrorResponse(BaseModel):
-    detail: str
