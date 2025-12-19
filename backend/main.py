@@ -1,35 +1,51 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+import redis
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from rq import Queue
 from sqlalchemy.orm import Session
 
 from auth import require_api_key
 from crud import create_tryon_job, get_tryon_job
 from database import get_db
 from schemas import TryOnCreateResponse, TryOnStatusResponse
-from settings import API_BASE_URL, RESULTS_DIR, STORAGE_DIR, UPLOADS_DIR
+from tasks import process_tryon_job
 
-app = FastAPI(title="TryOn SaaS API", version="1.0.0")
+BASE_DIR = Path(__file__).resolve().parent
+STORAGE_DIR = BASE_DIR / "storage"
+UPLOADS_DIR = STORAGE_DIR / "uploads"
+RESULTS_DIR = STORAGE_DIR / "results"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Servir storage (uploads/results/logs) por URL
-# Exemplo: http://127.0.0.1:8000/storage/results/<job_id>.png
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
+
+app = FastAPI(title="TryOn SaaS API", version="1.1.0")
 app.mount("/storage", StaticFiles(directory=str(STORAGE_DIR)), name="storage")
 
 
 def _save_upload(file: UploadFile, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    content = file.file.read()
     with out_path.open("wb") as f:
-        f.write(file.file.read())
+        f.write(content)
 
 
 def _result_url_for_job(job_id: UUID) -> str:
     return f"{API_BASE_URL}/tryon/{job_id}/result"
+
+
+def _get_queue() -> Queue:
+    r = redis.from_url(REDIS_URL)
+    return Queue("tryon", connection=r)
 
 
 @app.get("/health")
@@ -46,20 +62,21 @@ def create_tryon(
 ):
     job_id = uuid4()
 
-    # Salva uploads
     person_path = UPLOADS_DIR / f"{job_id}_person.jpg"
     garment_path = UPLOADS_DIR / f"{job_id}_garment.jpg"
-
     _save_upload(person_image, person_path)
     _save_upload(garment_image, garment_path)
 
-    # Cria job no banco como queued
     job = create_tryon_job(
         db=db,
         job_id=job_id,
         person_image_path=str(person_path),
         garment_image_path=str(garment_path),
     )
+
+    # Enfileira o job (RQ)
+    q = _get_queue()
+    q.enqueue(process_tryon_job, str(job.id), job_timeout=600)
 
     return TryOnCreateResponse(job_id=job.id, status=job.status)
 
@@ -93,22 +110,21 @@ def get_tryon_result(job_id: UUID, db: Session = Depends(get_db), _: str = Depen
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.status == "queued" or job.status == "processing":
+    if job.status in ("queued", "processing"):
         raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
-
     if job.status == "error":
         raise HTTPException(status_code=409, detail=f"Job errored: {job.error_message}")
 
     if not job.result_image_path:
-        raise HTTPException(status_code=500, detail="Job done but no result_image_path stored")
+        raise HTTPException(status_code=500, detail="Job done but no result_image_path")
 
     p = Path(job.result_image_path)
     if not p.exists():
         raise HTTPException(status_code=500, detail="Result file missing on disk")
 
-    # Força PNG quando aplicável
     media_type = mimetypes.guess_type(str(p))[0] or "image/png"
-    headers = {
-        "Cache-Control": "no-store",
-    }
-    return FileResponse(path=str(p), media_type=media_type, headers=headers)
+    return FileResponse(
+        path=str(p),
+        media_type=media_type,
+        headers={"Cache-Control": "no-store"},
+    )
