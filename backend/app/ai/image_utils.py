@@ -1,152 +1,188 @@
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Optional
-
-import cv2
+from typing import Any, Dict, List
 import numpy as np
-import mediapipe as mp
+import cv2
 
 
-@dataclass
-class AnchorBox:
-    x: int
-    y: int
-    w: int
-    h: int
+def decode_upload_to_bgr(upload_file) -> np.ndarray:
+    raw = upload_file.file.read()
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("Falha ao decodificar imagem.")
+    return bgr
 
 
-def is_background_white_strict(bgr: np.ndarray, sample_border: int = 20) -> bool:
-    """
-    Checa se o fundo da imagem é "branco suficiente".
-    Estratégia: amostrar bordas e medir quão perto está de branco.
-    """
-    h, w = bgr.shape[:2]
-    b = sample_border
-
-    top = bgr[:b, :, :]
-    bottom = bgr[h - b :, :, :]
-    left = bgr[:, :b, :]
-    right = bgr[:, w - b :, :]
-
-    samples = np.concatenate(
-        [
-            top.reshape(-1, 3),
-            bottom.reshape(-1, 3),
-            left.reshape(-1, 3),
-            right.reshape(-1, 3),
-        ],
-        axis=0,
-    )
-
-    # branco: (255,255,255) em BGR também.
-    mean = samples.mean(axis=0)
-    # tolerância bem exigente
-    return bool((mean > np.array([245, 245, 245])).all())
+def encode_png_rgba(bgra: np.ndarray) -> bytes:
+    rgba = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
+    ok, buf = cv2.imencode(".png", rgba)
+    if not ok:
+        raise RuntimeError("Falha ao codificar PNG.")
+    return buf.tobytes()
 
 
-def remove_white_background_premium(bgr: np.ndarray) -> np.ndarray:
-    """
-    Remove fundo branco e retorna BGRA.
-    Faz anti-halo + feather simples.
-    """
+def _laplacian_variance(gray: np.ndarray) -> float:
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _estimate_white_bg_ratio(bgr: np.ndarray, thr: int = 235) -> float:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-
-    # máscara do branco no HSV
-    lower = np.array([0, 0, 200], dtype=np.uint8)
-    upper = np.array([180, 50, 255], dtype=np.uint8)
-    mask_white = cv2.inRange(hsv, lower, upper)
-
-    # objeto = invert
-    mask_obj = cv2.bitwise_not(mask_white)
-
-    # limpeza
-    kernel = np.ones((3, 3), np.uint8)
-    mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask_obj = cv2.morphologyEx(mask_obj, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    # feather
-    mask_f = cv2.GaussianBlur(mask_obj, (0, 0), sigmaX=1.2, sigmaY=1.2)
-
-    # monta BGRA
-    b, g, r = cv2.split(bgr)
-    a = mask_f
-    bgra = cv2.merge([b, g, r, a])
-
-    return bgra
+    v = hsv[:, :, 2]
+    s = hsv[:, :, 1]
+    mask = (v >= thr) & (s <= 35)
+    return float(np.mean(mask))
 
 
-def detect_torso_anchor_mediapipe(person_bgr: np.ndarray) -> Optional[AnchorBox]:
-    """
-    Detecta um retângulo aproximado na região do torso/ombros para ancorar a roupa.
-    """
-    mp_pose = mp.solutions.pose
-    rgb = cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB)
-
-    with mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False) as pose:
-        res = pose.process(rgb)
-        if not res.pose_landmarks:
-            return None
-
-        h, w = person_bgr.shape[:2]
-        lm = res.pose_landmarks.landmark
-
-        # ombros
-        ls = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
-        rs = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-        lh = lm[mp_pose.PoseLandmark.LEFT_HIP]
-        rh = lm[mp_pose.PoseLandmark.RIGHT_HIP]
-
-        xs = [ls.x, rs.x, lh.x, rh.x]
-        ys = [ls.y, rs.y, lh.y, rh.y]
-
-        min_x = int(max(0, min(xs) * w))
-        max_x = int(min(w - 1, max(xs) * w))
-        min_y = int(max(0, min(ys) * h))
-        max_y = int(min(h - 1, max(ys) * h))
-
-        box_w = max_x - min_x
-        box_h = max_y - min_y
-
-        # padding
-        pad_x = int(box_w * 0.15)
-        pad_y = int(box_h * 0.10)
-
-        x = max(0, min_x - pad_x)
-        y = max(0, min_y - pad_y)
-        ww = min(w - x, box_w + 2 * pad_x)
-        hh = min(h - y, box_h + 2 * pad_y)
-
-        # mínimo razoável
-        if ww < 50 or hh < 50:
-            return None
-
-        return AnchorBox(x=x, y=y, w=ww, h=hh)
+def _edge_density(gray: np.ndarray) -> float:
+    edges = cv2.Canny(gray, 80, 180)
+    return float(np.mean(edges > 0))
 
 
-def overlay_bgra_on_bgr(background_bgr: np.ndarray, fg_bgra: np.ndarray, x: int, y: int) -> np.ndarray:
-    """
-    Composita fg_bgra em background_bgr na posição (x,y).
-    """
-    out = background_bgr.copy()
+def validate_garment_photo(bgr: np.ndarray) -> Dict[str, Any]:
+    h, w = bgr.shape[:2]
+    reasons: List[str] = []
+    tips: List[str] = []
+
+    if min(h, w) < 480:
+        reasons.append("LOW_RESOLUTION")
+        tips.append("Aproxime a peça e use maior resolução.")
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    sharpness = _laplacian_variance(gray)
+    if sharpness < 70:
+        reasons.append("TOO_BLURRY")
+        tips.append("Imagem desfocada. Apoie o celular e aumente a luz.")
+
+    brightness = float(np.mean(gray))
+    if brightness < 70:
+        reasons.append("LOW_LIGHT")
+        tips.append("Pouca luz. Faça a foto em ambiente mais iluminado.")
+
+    white_ratio = _estimate_white_bg_ratio(bgr, thr=235)
+    if white_ratio < 0.25:
+        reasons.append("BUSY_BACKGROUND")
+        tips.append("Fundo poluído. Prefira fundo liso e com contraste.")
+
+    ed = _edge_density(gray)
+    if ed > 0.18:
+        reasons.append("TOO_MUCH_TEXTURE")
+        tips.append("Fundo com muita textura. Use fundo simples.")
+
+    score = 1.0
+    if "LOW_RESOLUTION" in reasons: score -= 0.18
+    if "TOO_BLURRY" in reasons: score -= 0.25
+    if "LOW_LIGHT" in reasons: score -= 0.18
+    if "BUSY_BACKGROUND" in reasons: score -= 0.22
+    if "TOO_MUCH_TEXTURE" in reasons: score -= 0.12
+
+    score = float(np.clip(score, 0.0, 1.0))
+    ok = score >= 0.55
+
+    return {
+        "ok": ok,
+        "score": round(score, 3),
+        "reasons": reasons,
+        "tips": tips[:4],
+        "signals": {
+            "resolution": [int(w), int(h)],
+            "sharpness": round(float(sharpness), 2),
+            "brightness": round(float(brightness), 2),
+            "white_bg_ratio": round(float(white_ratio), 3),
+            "edge_density": round(float(ed), 3),
+        },
+    }
+
+
+def _decontaminate_border(bgra: np.ndarray) -> np.ndarray:
+    b = bgra[:, :, 0].astype(np.float32)
+    g = bgra[:, :, 1].astype(np.float32)
+    r = bgra[:, :, 2].astype(np.float32)
+    a = bgra[:, :, 3].astype(np.float32) / 255.0
+
+    edge = (a > 0.02) & (a < 0.85)
+    strength = np.zeros_like(a, dtype=np.float32)
+    strength[edge] = (0.85 - a[edge]) / 0.83
+
+    factor = 1.0 - 0.35 * strength
+    b = b * factor
+    g = g * factor
+    r = r * factor
+
+    out = bgra.copy()
+    out[:, :, 0] = np.clip(b, 0, 255).astype(np.uint8)
+    out[:, :, 1] = np.clip(g, 0, 255).astype(np.uint8)
+    out[:, :, 2] = np.clip(r, 0, 255).astype(np.uint8)
+    return out
+
+
+def _remove_white_background_to_bgra(bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+
+    bg = (v >= 235) & (s <= 40)
+    alpha = (~bg).astype(np.uint8) * 255
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=1.2, sigmaY=1.2)
+    alpha = np.clip(alpha, 0, 255).astype(np.uint8)
+
+    bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = alpha
+    return _decontaminate_border(bgra)
+
+
+def _grabcut_cutout_to_bgra(bgr: np.ndarray) -> np.ndarray:
+    h, w = bgr.shape[:2]
+    margin_x = int(w * 0.08)
+    margin_y = int(h * 0.08)
+    rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+
+    mask = np.zeros((h, w), np.uint8)
+    bgdModel = np.zeros((1, 65), np.float64)
+    fgdModel = np.zeros((1, 65), np.float64)
+
+    cv2.grabCut(bgr, mask, rect, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
+    fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype("uint8")
+
+    k = max(3, int(min(h, w) * 0.01) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel, iterations=1)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    fg = cv2.GaussianBlur(fg, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    fg = np.clip(fg, 0, 255).astype(np.uint8)
+
+    bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = fg
+    return _decontaminate_border(bgra)
+
+
+def garment_cutout_auto_bgra(bgr: np.ndarray) -> np.ndarray:
+    white_ratio = _estimate_white_bg_ratio(bgr, thr=232)
+    if white_ratio >= 0.55:
+        return _remove_white_background_to_bgra(bgr)
+    return _grabcut_cutout_to_bgra(bgr)
+
+
+def overlay_bgra_on_bgr(base_bgr: np.ndarray, fg_bgra: np.ndarray, x: int, y: int) -> np.ndarray:
+    out = base_bgr.copy()
     bh, bw = out.shape[:2]
     fh, fw = fg_bgra.shape[:2]
 
+    x1 = max(0, x)
+    y1 = max(0, y)
     x2 = min(bw, x + fw)
     y2 = min(bh, y + fh)
-
-    if x >= bw or y >= bh or x2 <= x or y2 <= y:
+    if x1 >= x2 or y1 >= y2:
         return out
 
-    roi = out[y:y2, x:x2]
-    fg = fg_bgra[0 : y2 - y, 0 : x2 - x]
+    roi = out[y1:y2, x1:x2]
+    fg_roi = fg_bgra[(y1 - y):(y2 - y), (x1 - x):(x2 - x)]
 
-    alpha = fg[:, :, 3].astype(np.float32) / 255.0
-    alpha = alpha[:, :, None]
+    alpha = (fg_roi[:, :, 3:4].astype(np.float32) / 255.0)
+    fg_rgb = fg_roi[:, :, :3].astype(np.float32)
+    bg_rgb = roi.astype(np.float32)
 
-    fg_rgb = fg[:, :, :3].astype(np.float32)
-    roi_f = roi.astype(np.float32)
-
-    comp = fg_rgb * alpha + roi_f * (1.0 - alpha)
-    out[y:y2, x:x2] = comp.astype(np.uint8)
+    comp = fg_rgb * alpha + bg_rgb * (1.0 - alpha)
+    out[y1:y2, x1:x2] = np.clip(comp, 0, 255).astype(np.uint8)
     return out

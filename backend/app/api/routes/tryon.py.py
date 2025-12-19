@@ -1,111 +1,88 @@
 from __future__ import annotations
 
-import mimetypes
+import os
 from pathlib import Path
-from uuid import UUID, uuid4
-
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from uuid import UUID
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from rq import Queue
 from sqlalchemy.orm import Session
 
-from app.api.schemas.tryon import TryOnCreateResponse, TryOnStatusResponse
-from app.core.config import API_BASE_URL
-from app.core.paths import STORAGE_DIR, UPLOADS_DIR
-from app.infra.db.crud import create_tryon_job, get_tryon_job
-from app.infra.queue.rq import get_queue
-from app.security.auth import require_api_key
-from app.workers.tasks import process_tryon_job
-
-router = APIRouter(tags=["tryon"])
+from settings import UPLOADS_DIR
+from app.api.deps import rate_limit
+from app.infra.db.database import get_db
+from app.infra.db.crud import create_job, get_job
 
 
-def _save_upload(file: UploadFile, out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("wb") as f:
-        f.write(file.file.read())
+router = APIRouter(prefix="/tryon", tags=["tryon"])
 
 
-def _result_url_for_job(job_id: UUID) -> str:
-    return f"{API_BASE_URL}/tryon/{job_id}/result"
-
-
-@router.post("/tryon", response_model=TryOnCreateResponse)
+@router.post("")
 def create_tryon(
     person_image: UploadFile = File(...),
     garment_image: UploadFile = File(...),
-    db: Session = Depends(lambda: next(__import__("app.infra.db.database").infra.db.database.get_db())),
-    _: str = Depends(require_api_key),
+    _api_key: str = Depends(rate_limit),
+    db: Session = Depends(get_db),
 ):
-    job_id = uuid4()
+    if not (person_image.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=415, detail={"error_code": "INVALID_PERSON_FILE", "message": "person_image must be an image"})
+    if not (garment_image.content_type or "").startswith("image/"):
+        raise HTTPException(status_code=415, detail={"error_code": "INVALID_GARMENT_FILE", "message": "garment_image must be an image"})
 
-    person_path = UPLOADS_DIR / f"{job_id}_person.jpg"
-    garment_path = UPLOADS_DIR / f"{job_id}_garment.jpg"
-    _save_upload(person_image, person_path)
-    _save_upload(garment_image, garment_path)
+    temp_id = UUID(bytes=os.urandom(16), version=4)
+    person_path = UPLOADS_DIR / f"{temp_id}_person.jpg"
+    garment_path = UPLOADS_DIR / f"{temp_id}_garment.jpg"
 
-    job = create_tryon_job(
-        db=db,
-        job_id=job_id,
-        person_image_path=str(person_path),
-        garment_image_path=str(garment_path),
-    )
+    person_path.write_bytes(person_image.file.read())
+    garment_path.write_bytes(garment_image.file.read())
 
-    q: Queue = get_queue()
-    q.enqueue(process_tryon_job, str(job.id), job_timeout=600)
-
-    return TryOnCreateResponse(job_id=job.id, status=job.status)
+    job = create_job(db, str(person_path), str(garment_path))
+    return {"job_id": str(job.id), "status": job.status}
 
 
-@router.get("/tryon/{job_id}", response_model=TryOnStatusResponse)
+@router.get("/{job_id}")
 def get_tryon_status(
-    job_id: UUID,
-    db: Session = Depends(lambda: next(__import__("app.infra.db.database").infra.db.database.get_db())),
-    _: str = Depends(require_api_key),
+    job_id: str,
+    _api_key: str = Depends(rate_limit),
+    db: Session = Depends(get_db),
 ):
-    job = get_tryon_job(db=db, job_id=job_id)
+    job = get_job(db, UUID(job_id))
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail={"error_code": "JOB_NOT_FOUND", "message": "Job not found"})
 
-    result_url = None
-    if job.status == "done":
-        result_url = _result_url_for_job(job.id)
-
-    return TryOnStatusResponse(
-        job_id=job.id,
-        status=job.status,
-        person_image_path=job.person_image_path,
-        garment_image_path=job.garment_image_path,
-        result_image_path=job.result_image_path,
-        result_url=result_url,
-        error_message=job.error_message,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-    )
+    return {
+        "job_id": str(job.id),
+        "status": job.status,
+        "person_image_path": job.person_image_path,
+        "garment_image_path": job.garment_image_path,
+        "result_image_path": job.result_image_path,
+        "error_code": job.error_code,
+        "error_message": job.error_message,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+    }
 
 
-@router.get("/tryon/{job_id}/result")
+@router.get("/{job_id}/result")
 def get_tryon_result(
-    job_id: UUID,
-    db: Session = Depends(lambda: next(__import__("app.infra.db.database").infra.db.database.get_db())),
-    _: str = Depends(require_api_key),
+    job_id: str,
+    _api_key: str = Depends(rate_limit),
+    db: Session = Depends(get_db),
 ):
-    job = get_tryon_job(db=db, job_id=job_id)
+    job = get_job(db, UUID(job_id))
     if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+        raise HTTPException(status_code=404, detail={"error_code": "JOB_NOT_FOUND", "message": "Job not found"})
 
     if job.status in ("queued", "processing"):
-        raise HTTPException(status_code=409, detail=f"Job not ready (status={job.status})")
+        raise HTTPException(status_code=409, detail={"error_code": "JOB_NOT_READY", "message": f"Job not ready: {job.status}"})
+
     if job.status == "error":
-        raise HTTPException(status_code=409, detail=f"Job errored: {job.error_message}")
+        raise HTTPException(status_code=409, detail={
+            "error_code": "JOB_ERROR",
+            "message": f"Job errored: {job.error_code}",
+            "details": {"error_message": job.error_message},
+        })
 
-    if not job.result_image_path:
-        raise HTTPException(status_code=500, detail="Job done but no result_image_path stored")
+    if not job.result_image_path or not Path(job.result_image_path).exists():
+        raise HTTPException(status_code=404, detail={"error_code": "RESULT_NOT_FOUND", "message": "Result file not found"})
 
-    p = Path(job.result_image_path)
-    if not p.exists():
-        raise HTTPException(status_code=500, detail="Result file missing on disk")
-
-    media_type = mimetypes.guess_type(str(p))[0] or "image/png"
-    return FileResponse(str(p), media_type=media_type, headers={"Cache-Control": "no-store"})
+    return FileResponse(job.result_image_path, media_type="image/png")

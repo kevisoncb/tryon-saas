@@ -1,25 +1,33 @@
-from __future__ import annotations
-
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
+from fastapi import HTTPException
 
 
 class SimpleRateLimiter:
-    def __init__(self, rpm_limit_default: int = 60):
-        self.rpm_default = rpm_limit_default
-        self.hits = defaultdict(deque)
+    """
+    Limiter simples em memória.
+    Em produção, isso vira Redis/Upstash, mas mantém o código limpo agora.
+    """
+    def __init__(self):
+        self._buckets = defaultdict(lambda: {"tokens": 0.0, "ts": time.time()})
 
-    def allow(self, api_key: str, rpm_limit: int | None = None) -> bool:
-        limit = rpm_limit or self.rpm_default
+    def check(self, key: str, rpm_limit: int):
+        if rpm_limit <= 0:
+            return
+
         now = time.time()
-        q = self.hits[api_key]
+        b = self._buckets[key]
+        elapsed = now - b["ts"]
+        b["ts"] = now
 
-        # remove >60s
-        while q and now - q[0] > 60:
-            q.popleft()
+        refill_per_sec = rpm_limit / 60.0
+        b["tokens"] = min(float(rpm_limit), b["tokens"] + elapsed * refill_per_sec)
 
-        if len(q) >= limit:
-            return False
+        if b["tokens"] < 1.0:
+            raise HTTPException(status_code=429, detail={
+                "error_code": "RATE_LIMIT",
+                "message": "Too many requests. Slow down.",
+                "details": {"rpm_limit": rpm_limit}
+            })
 
-        q.append(now)
-        return True
+        b["tokens"] -= 1.0
